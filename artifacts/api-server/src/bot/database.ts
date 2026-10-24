@@ -1,0 +1,1251 @@
+import { mkdirSync } from "node:fs";
+import path from "node:path";
+import { DatabaseSync } from "node:sqlite";
+import { databaseFileName } from "./brand.ts";
+
+export type Movie = {
+  id: number;
+  code: string;
+  title: string;
+  channelChatId: string;
+  channelMessageId: number;
+  createdAt: string;
+};
+
+export type MoviePost = {
+  id: number;
+  movieId: number;
+  postNumber: number;
+  title: string;
+  channelChatId: string;
+  channelMessageId: number;
+  createdAt: string;
+};
+
+export type Series = {
+  id: number;
+  code: string;
+  title: string;
+  episodeCount: number;
+  seasonCount: number;
+  createdAt: string;
+};
+
+export type SeriesEpisode = {
+  id: number;
+  seriesId: number;
+  seasonNumber: number;
+  episodeNumber: number;
+  title: string;
+  channelChatId: string;
+  channelMessageId: number;
+  createdAt: string;
+};
+
+const databasePath = process.env.DATABASE_PATH
+  ? path.resolve(process.env.DATABASE_PATH)
+  : path.resolve(
+      process.env.DATABASE_DIR ?? path.join(process.cwd(), "data"),
+      databaseFileName(),
+    );
+mkdirSync(path.dirname(databasePath), { recursive: true });
+
+const database = new DatabaseSync(databasePath);
+
+/** Qo'shimcha saqlash qatlamlari (requests-store.ts, search-store.ts) shu bazadan foydalanadi. */
+export function getDatabase(): DatabaseSync {
+  return database;
+}
+
+database.exec(`
+  PRAGMA journal_mode = WAL;
+  PRAGMA foreign_keys = ON;
+
+  CREATE TABLE IF NOT EXISTS movies (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    channel_chat_id TEXT NOT NULL,
+    channel_message_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+
+  CREATE TABLE IF NOT EXISTS genres (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE
+  );
+
+  CREATE TABLE IF NOT EXISTS movie_genres (
+    movie_id INTEGER NOT NULL,
+    genre_id INTEGER NOT NULL,
+    PRIMARY KEY (movie_id, genre_id),
+    FOREIGN KEY (movie_id) REFERENCES movies(id) ON DELETE CASCADE,
+    FOREIGN KEY (genre_id) REFERENCES genres(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS movie_posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    movie_id INTEGER NOT NULL,
+    post_number INTEGER NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    channel_chat_id TEXT NOT NULL,
+    channel_message_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (movie_id, post_number),
+    FOREIGN KEY (movie_id) REFERENCES movies(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS series (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL UNIQUE,
+    title TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS series_episodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    series_id INTEGER NOT NULL,
+    season_number INTEGER NOT NULL DEFAULT 1,
+    episode_number INTEGER NOT NULL,
+    title TEXT NOT NULL DEFAULT '',
+    channel_chat_id TEXT NOT NULL,
+    channel_message_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (series_id, season_number, episode_number),
+    FOREIGN KEY (series_id) REFERENCES series(id) ON DELETE CASCADE
+  );
+
+  CREATE TABLE IF NOT EXISTS series_last_delivery (
+    chat_id INTEGER NOT NULL,
+    series_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chat_id, series_id),
+    FOREIGN KEY (series_id) REFERENCES series(id) ON DELETE CASCADE
+  );
+`);
+
+database.exec(`
+  INSERT INTO movie_posts
+    (movie_id, post_number, title, channel_chat_id, channel_message_id, created_at)
+  SELECT movies.id, 1, movies.title, movies.channel_chat_id,
+         movies.channel_message_id, movies.created_at
+  FROM movies
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM movie_posts
+    WHERE movie_posts.movie_id = movies.id AND movie_posts.post_number = 1
+  );
+`);
+
+const seriesEpisodeColumns = database
+  .prepare("PRAGMA table_info(series_episodes)")
+  .all() as Array<Record<string, unknown>>;
+
+if (!seriesEpisodeColumns.some((column) => column.name === "season_number")) {
+  database.exec(`
+    PRAGMA foreign_keys = OFF;
+    BEGIN IMMEDIATE;
+    CREATE TABLE series_episodes_migrated (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      series_id INTEGER NOT NULL,
+      season_number INTEGER NOT NULL DEFAULT 1,
+      episode_number INTEGER NOT NULL,
+      title TEXT NOT NULL DEFAULT '',
+      channel_chat_id TEXT NOT NULL,
+      channel_message_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (series_id, season_number, episode_number),
+      FOREIGN KEY (series_id) REFERENCES series(id) ON DELETE CASCADE
+    );
+    INSERT INTO series_episodes_migrated
+      (id, series_id, season_number, episode_number, title,
+       channel_chat_id, channel_message_id, created_at)
+    SELECT id, series_id, 1, episode_number, title,
+           channel_chat_id, channel_message_id, created_at
+    FROM series_episodes;
+    DROP TABLE series_episodes;
+    ALTER TABLE series_episodes_migrated RENAME TO series_episodes;
+    COMMIT;
+    PRAGMA foreign_keys = ON;
+  `);
+}
+
+function mapMovie(row: Record<string, unknown>): Movie {
+  return {
+    id: Number(row.id),
+    code: String(row.code),
+    title: String(row.title),
+    channelChatId: String(row.channel_chat_id),
+    channelMessageId: Number(row.channel_message_id),
+    createdAt: String(row.created_at),
+  };
+}
+
+function mapSeries(row: Record<string, unknown>): Series {
+  return {
+    id: Number(row.id),
+    code: String(row.code),
+    title: String(row.title),
+    episodeCount: Number(row.episode_count ?? 0),
+    seasonCount: Number(row.season_count ?? 0),
+    createdAt: String(row.created_at),
+  };
+}
+
+const seriesColumns = database
+  .prepare("PRAGMA table_info(series)")
+  .all() as Array<Record<string, unknown>>;
+if (!seriesColumns.some((column) => column.name === "poster_file_id")) {
+  database.exec("ALTER TABLE series ADD COLUMN poster_file_id TEXT");
+}
+if (!seriesColumns.some((column) => column.name === "poster_caption")) {
+  database.exec("ALTER TABLE series ADD COLUMN poster_caption TEXT");
+}
+
+const movieColumns = database
+  .prepare("PRAGMA table_info(movies)")
+  .all() as Array<Record<string, unknown>>;
+if (!movieColumns.some((column) => column.name === "poster_file_id")) {
+  database.exec("ALTER TABLE movies ADD COLUMN poster_file_id TEXT");
+}
+if (!movieColumns.some((column) => column.name === "poster_caption")) {
+  database.exec("ALTER TABLE movies ADD COLUMN poster_caption TEXT");
+}
+
+database.exec(`
+  CREATE TABLE IF NOT EXISTS series_progress (
+    chat_id INTEGER NOT NULL,
+    series_id INTEGER NOT NULL,
+    episode_id INTEGER NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chat_id, series_id),
+    FOREIGN KEY (series_id) REFERENCES series(id) ON DELETE CASCADE,
+    FOREIGN KEY (episode_id) REFERENCES series_episodes(id) ON DELETE CASCADE
+  );
+`);
+
+database.exec(`
+  CREATE TABLE IF NOT EXISTS series_subscriptions (
+    chat_id INTEGER NOT NULL,
+    series_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chat_id, series_id),
+    FOREIGN KEY (series_id) REFERENCES series(id) ON DELETE CASCADE
+  );
+`);
+
+database.exec(`
+  CREATE TABLE IF NOT EXISTS content_views (
+    kind TEXT NOT NULL,
+    content_id INTEGER NOT NULL,
+    chat_id INTEGER NOT NULL,
+    day TEXT NOT NULL,
+    PRIMARY KEY (kind, content_id, chat_id, day)
+  );
+  CREATE INDEX IF NOT EXISTS idx_content_views_day ON content_views (day);
+`);
+
+database.exec(`
+  CREATE TABLE IF NOT EXISTS favorites (
+    chat_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    content_id INTEGER NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chat_id, kind, content_id)
+  );
+`);
+
+function mapSeriesEpisode(row: Record<string, unknown>): SeriesEpisode {
+  return {
+    id: Number(row.id),
+    seriesId: Number(row.series_id),
+    seasonNumber: Number(row.season_number),
+    episodeNumber: Number(row.episode_number),
+    title: String(row.title ?? ""),
+    channelChatId: String(row.channel_chat_id),
+    channelMessageId: Number(row.channel_message_id),
+    createdAt: String(row.created_at),
+  };
+}
+
+function mapMoviePost(row: Record<string, unknown>): MoviePost {
+  return {
+    id: Number(row.id),
+    movieId: Number(row.movie_id),
+    postNumber: Number(row.post_number),
+    title: String(row.title ?? ""),
+    channelChatId: String(row.channel_chat_id),
+    channelMessageId: Number(row.channel_message_id),
+    createdAt: String(row.created_at),
+  };
+}
+
+export function findMovie(code: string): Movie | null {
+  const row = database
+    .prepare(
+      `SELECT id, code, title, channel_chat_id, channel_message_id, created_at
+       FROM movies WHERE code = ?`,
+    )
+    .get(code) as Record<string, unknown> | undefined;
+
+  return row ? mapMovie(row) : null;
+}
+
+export function listMovies(): Movie[] {
+  const rows = database
+    .prepare(
+      `SELECT id, code, title, channel_chat_id, channel_message_id, created_at
+       FROM movies ORDER BY id DESC`,
+    )
+    .all() as Record<string, unknown>[];
+
+  return rows.map(mapMovie);
+}
+
+export function searchMovies(query: string): Movie[] {
+  const normalizedQuery = query.trim();
+  if (!normalizedQuery) {
+    return [];
+  }
+
+  const pattern = `%${normalizedQuery}%`;
+  const rows = database
+    .prepare(
+      `SELECT id, code, title, channel_chat_id, channel_message_id, created_at
+       FROM movies
+       WHERE code LIKE ? OR title LIKE ?
+       ORDER BY CASE WHEN code = ? THEN 0 ELSE 1 END, title COLLATE NOCASE
+       LIMIT 25`,
+    )
+    .all(pattern, pattern, normalizedQuery) as Record<string, unknown>[];
+
+  return rows.map(mapMovie);
+}
+
+export function listMoviePosts(movieCode: string): MoviePost[] {
+  const rows = database
+    .prepare(
+      `SELECT movie_posts.id, movie_posts.movie_id, movie_posts.post_number,
+              movie_posts.title, movie_posts.channel_chat_id,
+              movie_posts.channel_message_id, movie_posts.created_at
+       FROM movie_posts
+       INNER JOIN movies ON movies.id = movie_posts.movie_id
+       WHERE movies.code = ?
+       ORDER BY movie_posts.post_number`,
+    )
+    .all(movieCode) as Record<string, unknown>[];
+
+  return rows.map(mapMoviePost);
+}
+
+export function findSeries(code: string): Series | null {
+  const row = database
+    .prepare(
+      `SELECT series.id, series.code, series.title, series.created_at,
+              COUNT(series_episodes.id) AS episode_count,
+              COUNT(DISTINCT series_episodes.season_number) AS season_count
+       FROM series
+       LEFT JOIN series_episodes ON series_episodes.series_id = series.id
+       WHERE series.code = ?
+       GROUP BY series.id`,
+    )
+    .get(code) as Record<string, unknown> | undefined;
+
+  return row ? mapSeries(row) : null;
+}
+
+export function searchSeries(query: string): Series[] {
+  const normalizedQuery = query.trim();
+  if (!normalizedQuery) {
+    return [];
+  }
+
+  const pattern = `%${normalizedQuery}%`;
+  const rows = database
+    .prepare(
+      `SELECT series.id, series.code, series.title, series.created_at,
+              COUNT(series_episodes.id) AS episode_count,
+              COUNT(DISTINCT series_episodes.season_number) AS season_count
+       FROM series
+       LEFT JOIN series_episodes ON series_episodes.series_id = series.id
+       WHERE series.code LIKE ? OR series.title LIKE ?
+       GROUP BY series.id
+       ORDER BY CASE WHEN series.code = ? THEN 0 ELSE 1 END,
+                series.title COLLATE NOCASE
+       LIMIT 25`,
+    )
+    .all(pattern, pattern, normalizedQuery) as Record<string, unknown>[];
+
+  return rows.map(mapSeries);
+}
+
+export function listSeries(): Series[] {
+  const rows = database
+    .prepare(
+      `SELECT series.id, series.code, series.title, series.created_at,
+              COUNT(series_episodes.id) AS episode_count,
+              COUNT(DISTINCT series_episodes.season_number) AS season_count
+       FROM series
+       LEFT JOIN series_episodes ON series_episodes.series_id = series.id
+       GROUP BY series.id
+       ORDER BY series.id DESC`,
+    )
+    .all() as Record<string, unknown>[];
+
+  return rows.map(mapSeries);
+}
+
+export function upsertSeries(input: { code: string; title: string }): Series {
+  database
+    .prepare(
+      `INSERT INTO series (code, title) VALUES (?, ?)
+       ON CONFLICT(code) DO UPDATE SET title = excluded.title`,
+    )
+    .run(input.code, input.title);
+
+  return findSeries(input.code) as Series;
+}
+
+export function listSeriesSeasons(seriesCode: string): number[] {
+  const rows = database
+    .prepare(
+      `SELECT DISTINCT series_episodes.season_number
+       FROM series_episodes
+       INNER JOIN series ON series.id = series_episodes.series_id
+       WHERE series.code = ?
+       ORDER BY series_episodes.season_number`,
+    )
+    .all(seriesCode) as Record<string, unknown>[];
+
+  return rows.map((row) => Number(row.season_number));
+}
+
+export function listSeriesEpisodes(
+  seriesCode: string,
+  seasonNumber?: number,
+): SeriesEpisode[] {
+  const query = seasonNumber
+    ? `SELECT series_episodes.id, series_episodes.series_id,
+              series_episodes.season_number, series_episodes.episode_number,
+              series_episodes.title, series_episodes.channel_chat_id,
+              series_episodes.channel_message_id, series_episodes.created_at
+       FROM series_episodes
+       INNER JOIN series ON series.id = series_episodes.series_id
+       WHERE series.code = ? AND series_episodes.season_number = ?
+       ORDER BY series_episodes.episode_number`
+    : `SELECT series_episodes.id, series_episodes.series_id,
+              series_episodes.season_number, series_episodes.episode_number,
+              series_episodes.title, series_episodes.channel_chat_id,
+              series_episodes.channel_message_id, series_episodes.created_at
+       FROM series_episodes
+       INNER JOIN series ON series.id = series_episodes.series_id
+       WHERE series.code = ?
+       ORDER BY series_episodes.season_number, series_episodes.episode_number`;
+  const rows = database.prepare(query).all(
+    ...(seasonNumber ? [seriesCode, seasonNumber] : [seriesCode]),
+  ) as Record<string, unknown>[];
+
+  return rows.map(mapSeriesEpisode);
+}
+
+export function findSeriesEpisode(
+  seriesCode: string,
+  seasonNumber: number,
+  episodeNumber: number,
+): SeriesEpisode | null {
+  const row = database
+    .prepare(
+      `SELECT series_episodes.id, series_episodes.series_id,
+              series_episodes.season_number, series_episodes.episode_number,
+              series_episodes.title,
+              series_episodes.channel_chat_id,
+              series_episodes.channel_message_id,
+              series_episodes.created_at
+       FROM series_episodes
+       INNER JOIN series ON series.id = series_episodes.series_id
+       WHERE series.code = ? AND series_episodes.season_number = ?
+         AND series_episodes.episode_number = ?`,
+    )
+    .get(seriesCode, seasonNumber, episodeNumber) as
+    | Record<string, unknown>
+    | undefined;
+
+  return row ? mapSeriesEpisode(row) : null;
+}
+
+export function findSeriesEpisodeById(
+  episodeId: number,
+): (SeriesEpisode & { seriesCode: string }) | null {
+  const row = database
+    .prepare(
+      `SELECT series_episodes.id, series_episodes.series_id,
+              series_episodes.season_number, series_episodes.episode_number,
+              series_episodes.title, series_episodes.channel_chat_id,
+              series_episodes.channel_message_id, series_episodes.created_at,
+              series.code AS series_code
+       FROM series_episodes
+       INNER JOIN series ON series.id = series_episodes.series_id
+       WHERE series_episodes.id = ?`,
+    )
+    .get(episodeId) as Record<string, unknown> | undefined;
+
+  return row
+    ? { ...mapSeriesEpisode(row), seriesCode: String(row.series_code) }
+    : null;
+}
+
+export function upsertSeriesEpisode(input: {
+  seriesCode: string;
+  seasonNumber: number;
+  episodeNumber: number;
+  title: string;
+  channelChatId: string;
+  channelMessageId: number;
+}): SeriesEpisode | null {
+  const series = findSeries(input.seriesCode);
+  if (!series) {
+    return null;
+  }
+
+  database
+    .prepare(
+      `INSERT INTO series_episodes
+         (series_id, season_number, episode_number, title,
+          channel_chat_id, channel_message_id)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(series_id, season_number, episode_number) DO UPDATE SET
+         title = excluded.title,
+         channel_chat_id = excluded.channel_chat_id,
+         channel_message_id = excluded.channel_message_id`,
+    )
+    .run(
+      series.id,
+      input.seasonNumber,
+      input.episodeNumber,
+      input.title,
+      input.channelChatId,
+      input.channelMessageId,
+    );
+
+  return findSeriesEpisode(
+    input.seriesCode,
+    input.seasonNumber,
+    input.episodeNumber,
+  );
+}
+
+export function updateSeriesEpisodeTitle(
+  seriesCode: string,
+  seasonNumber: number,
+  episodeNumber: number,
+  title: string,
+): boolean {
+  const result = database
+    .prepare(
+      `UPDATE series_episodes SET title = ?
+       WHERE season_number = ? AND episode_number = ?
+         AND series_id = (SELECT id FROM series WHERE code = ?)`,
+    )
+    .run(title, seasonNumber, episodeNumber, seriesCode);
+
+  return Number(result.changes) > 0;
+}
+
+/** Ishlayotgan bazaning izchil nusxasini (WAL bilan ham) yangi faylga yozadi. */
+export function createDatabaseBackup(targetPath: string): void {
+  database.prepare("VACUUM INTO ?").run(targetPath);
+}
+
+database.exec(`
+  CREATE TABLE IF NOT EXISTS bot_users (
+    chat_id INTEGER PRIMARY KEY,
+    first_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+  INSERT OR IGNORE INTO bot_users (chat_id)
+  SELECT DISTINCT chat_id FROM series_progress;
+`);
+const botUserColumns = database
+  .prepare("PRAGMA table_info(bot_users)")
+  .all() as Array<{ name: string }>;
+if (!botUserColumns.some((column) => column.name === "blocked")) {
+  database.exec("ALTER TABLE bot_users ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0");
+}
+
+export function touchBotUser(chatId: number): void {
+  try {
+    database
+      .prepare(
+        `INSERT INTO bot_users (chat_id) VALUES (?)
+         ON CONFLICT(chat_id) DO UPDATE SET last_seen = CURRENT_TIMESTAMP, blocked = 0`,
+      )
+      .run(chatId);
+  } catch {
+    // statistika xatosi botni to'xtatmasligi kerak
+  }
+}
+
+export function getBotStats(): {
+  users: number;
+  activeDay: number;
+  activeWeek: number;
+  newDay: number;
+  movies: number;
+  moviePosts: number;
+  series: number;
+  episodes: number;
+} {
+  const count = (table: string): number =>
+    Number((database.prepare(`SELECT COUNT(*) AS n FROM ${table}`).get() as { n: number }).n);
+  const users = database
+    .prepare(
+      `SELECT COUNT(*) AS total,
+              COALESCE(SUM(last_seen >= datetime('now', '-1 day')), 0) AS day,
+              COALESCE(SUM(last_seen >= datetime('now', '-7 day')), 0) AS week,
+              COALESCE(SUM(first_seen >= datetime('now', '-1 day')), 0) AS fresh
+       FROM bot_users`,
+    )
+    .get() as Record<string, number>;
+
+  return {
+    users: Number(users.total),
+    activeDay: Number(users.day),
+    activeWeek: Number(users.week),
+    newDay: Number(users.fresh),
+    movies: count("movies"),
+    moviePosts: count("movie_posts"),
+    series: count("series"),
+    episodes: count("series_episodes"),
+  };
+}
+
+export function listBroadcastRecipients(): number[] {
+  const rows = database
+    .prepare("SELECT chat_id FROM bot_users WHERE blocked = 0 ORDER BY chat_id")
+    .all() as Array<{ chat_id: number }>;
+  return rows.map((row) => Number(row.chat_id));
+}
+
+export function markBotUserBlocked(chatIds: number[]): void {
+  const statement = database.prepare("UPDATE bot_users SET blocked = 1 WHERE chat_id = ?");
+  for (const chatId of chatIds) {
+    statement.run(chatId);
+  }
+}
+
+export function updateSeriesEpisodeTitles(
+  seriesCode: string,
+  seasonNumber: number,
+  items: Array<{ episode: number; title: string }>,
+): { updated: number[]; missing: number[] } {
+  const updated: number[] = [];
+  const missing: number[] = [];
+  database.exec("BEGIN");
+  try {
+    for (const item of items) {
+      if (updateSeriesEpisodeTitle(seriesCode, seasonNumber, item.episode, item.title)) {
+        updated.push(item.episode);
+      } else {
+        missing.push(item.episode);
+      }
+    }
+    database.exec("COMMIT");
+  } catch (err: unknown) {
+    database.exec("ROLLBACK");
+    throw err;
+  }
+  return { updated, missing };
+}
+
+export function clearSeriesPoster(seriesCode: string): boolean {
+  const result = database
+    .prepare(
+      "UPDATE series SET poster_file_id = NULL, poster_caption = NULL WHERE code = ? AND poster_file_id IS NOT NULL",
+    )
+    .run(seriesCode);
+  return Number(result.changes) > 0;
+}
+
+export function setSeriesPoster(
+  seriesCode: string,
+  fileId: string,
+  caption: string | null = null,
+): boolean {
+  const result = database
+    .prepare(
+      "UPDATE series SET poster_file_id = ?, poster_caption = COALESCE(?, poster_caption) WHERE code = ?",
+    )
+    .run(fileId, caption, seriesCode);
+  return Number(result.changes) > 0;
+}
+
+export function getSeriesPoster(seriesCode: string): string | null {
+  const row = database
+    .prepare("SELECT poster_file_id FROM series WHERE code = ?")
+    .get(seriesCode) as Record<string, unknown> | undefined;
+  const value = row?.poster_file_id;
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+export function getSeriesPosterCaption(seriesCode: string): string | null {
+  const row = database
+    .prepare("SELECT poster_caption FROM series WHERE code = ?")
+    .get(seriesCode) as Record<string, unknown> | undefined;
+  const value = row?.poster_caption;
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+export function clearMoviePoster(movieCode: string): boolean {
+  const result = database
+    .prepare(
+      "UPDATE movies SET poster_file_id = NULL, poster_caption = NULL WHERE code = ? AND poster_file_id IS NOT NULL",
+    )
+    .run(movieCode);
+  return Number(result.changes) > 0;
+}
+
+export function setMoviePoster(
+  movieCode: string,
+  fileId: string,
+  caption: string | null = null,
+): boolean {
+  const result = database
+    .prepare(
+      "UPDATE movies SET poster_file_id = ?, poster_caption = COALESCE(?, poster_caption) WHERE code = ?",
+    )
+    .run(fileId, caption, movieCode);
+  return Number(result.changes) > 0;
+}
+
+export function getMoviePoster(movieCode: string): string | null {
+  const row = database
+    .prepare("SELECT poster_file_id FROM movies WHERE code = ?")
+    .get(movieCode) as Record<string, unknown> | undefined;
+  const value = row?.poster_file_id;
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+export function getMoviePosterCaption(movieCode: string): string | null {
+  const row = database
+    .prepare("SELECT poster_caption FROM movies WHERE code = ?")
+    .get(movieCode) as Record<string, unknown> | undefined;
+  const value = row?.poster_caption;
+  return typeof value === "string" && value.trim().length > 0 ? value : null;
+}
+
+export function saveSeriesProgress(chatId: number, episodeId: number): void {
+  database
+    .prepare(
+      `INSERT INTO series_progress (chat_id, series_id, episode_id)
+       SELECT ?, series_id, id FROM series_episodes WHERE id = ?
+       ON CONFLICT(chat_id, series_id) DO UPDATE SET
+         episode_id = excluded.episode_id,
+         updated_at = CURRENT_TIMESTAMP`,
+    )
+    .run(chatId, episodeId);
+}
+
+export function getSeriesProgress(
+  chatId: number,
+  seriesCode: string,
+): (SeriesEpisode & { seriesCode: string }) | null {
+  const row = database
+    .prepare(
+      `SELECT series_episodes.id, series_episodes.series_id,
+              series_episodes.season_number, series_episodes.episode_number,
+              series_episodes.title, series_episodes.channel_chat_id,
+              series_episodes.channel_message_id, series_episodes.created_at,
+              series.code AS series_code
+       FROM series_progress
+       INNER JOIN series ON series.id = series_progress.series_id
+       INNER JOIN series_episodes ON series_episodes.id = series_progress.episode_id
+       WHERE series_progress.chat_id = ? AND series.code = ?`,
+    )
+    .get(chatId, seriesCode) as Record<string, unknown> | undefined;
+
+  return row
+    ? { ...mapSeriesEpisode(row), seriesCode: String(row.series_code) }
+    : null;
+}
+
+export function isSeriesSubscribed(chatId: number, seriesCode: string): boolean {
+  const row = database
+    .prepare(
+      `SELECT 1 FROM series_subscriptions
+       INNER JOIN series ON series.id = series_subscriptions.series_id
+       WHERE series_subscriptions.chat_id = ? AND series.code = ?`,
+    )
+    .get(chatId, seriesCode);
+  return row !== undefined;
+}
+
+/** Obunani almashtiradi: yangi holatni (true = obuna), serial yo'q bo'lsa null qaytaradi. */
+export function toggleSeriesSubscription(
+  chatId: number,
+  seriesCode: string,
+): boolean | null {
+  const series = database
+    .prepare("SELECT id FROM series WHERE code = ?")
+    .get(seriesCode) as { id: number } | undefined;
+  if (!series) {
+    return null;
+  }
+
+  if (isSeriesSubscribed(chatId, seriesCode)) {
+    database
+      .prepare("DELETE FROM series_subscriptions WHERE chat_id = ? AND series_id = ?")
+      .run(chatId, series.id);
+    return false;
+  }
+
+  database
+    .prepare("INSERT OR IGNORE INTO series_subscriptions (chat_id, series_id) VALUES (?, ?)")
+    .run(chatId, series.id);
+  return true;
+}
+
+export function listSeriesSubscribers(seriesCode: string): number[] {
+  const rows = database
+    .prepare(
+      `SELECT series_subscriptions.chat_id FROM series_subscriptions
+       INNER JOIN series ON series.id = series_subscriptions.series_id
+       WHERE series.code = ? ORDER BY series_subscriptions.created_at, series_subscriptions.chat_id`,
+    )
+    .all(seriesCode) as Array<{ chat_id: number }>;
+  return rows.map((row) => row.chat_id);
+}
+
+export function removeSeriesSubscriber(chatId: number, seriesCode: string): void {
+  database
+    .prepare(
+      `DELETE FROM series_subscriptions WHERE chat_id = ?
+       AND series_id = (SELECT id FROM series WHERE code = ?)`,
+    )
+    .run(chatId, seriesCode);
+}
+
+export function listUserSubscriptions(chatId: number): Array<{ code: string; title: string }> {
+  return database
+    .prepare(
+      `SELECT series.code AS code, series.title AS title FROM series_subscriptions
+       INNER JOIN series ON series.id = series_subscriptions.series_id
+       WHERE series_subscriptions.chat_id = ? ORDER BY series.title`,
+    )
+    .all(chatId) as Array<{ code: string; title: string }>;
+}
+
+const todayUtc = (): string => new Date().toISOString().slice(0, 10);
+
+/** Bir foydalanuvchining bir kontentni bir kunda ko'rishi bir marta hisoblanadi. */
+export function recordMovieView(chatId: number, movieId: number, day: string = todayUtc()): void {
+  database
+    .prepare(
+      `INSERT OR IGNORE INTO content_views (kind, content_id, chat_id, day)
+       SELECT 'movie', id, ?, ? FROM movies WHERE id = ?`,
+    )
+    .run(chatId, day, movieId);
+}
+
+export function recordEpisodeView(chatId: number, episodeId: number, day: string = todayUtc()): void {
+  database
+    .prepare(
+      `INSERT OR IGNORE INTO content_views (kind, content_id, chat_id, day)
+       SELECT 'series', series_id, ?, ? FROM series_episodes WHERE id = ?`,
+    )
+    .run(chatId, day, episodeId);
+}
+
+export function listTopContent(
+  limit = 10,
+  days = 30,
+  now: Date = new Date(),
+): Array<{ kind: "movie" | "series"; code: string; title: string; viewers: number }> {
+  const since = new Date(now.getTime() - days * 86_400_000).toISOString().slice(0, 10);
+  const rows = database
+    .prepare(
+      `SELECT kind, code, title, viewers FROM (
+         SELECT 'movie' AS kind, movies.code AS code, movies.title AS title, COUNT(*) AS viewers
+         FROM content_views INNER JOIN movies ON movies.id = content_views.content_id
+         WHERE content_views.kind = 'movie' AND content_views.day >= ?
+         GROUP BY movies.id
+         UNION ALL
+         SELECT 'series', series.code, series.title, COUNT(*)
+         FROM content_views INNER JOIN series ON series.id = content_views.content_id
+         WHERE content_views.kind = 'series' AND content_views.day >= ?
+         GROUP BY series.id
+       ) ORDER BY viewers DESC, title COLLATE NOCASE LIMIT ?`,
+    )
+    .all(since, since, limit) as Array<{ kind: string; code: string; title: string; viewers: number }>;
+  return rows.map((row) => ({
+    kind: row.kind === "series" ? "series" : "movie",
+    code: String(row.code),
+    title: String(row.title),
+    viewers: Number(row.viewers),
+  }));
+}
+
+export function listRecentEpisodes(limit = 5): Array<{
+  id: number;
+  seriesCode: string;
+  seriesTitle: string;
+  seasonNumber: number;
+  episodeNumber: number;
+}> {
+  const rows = database
+    .prepare(
+      `SELECT series_episodes.id AS id, series.code AS series_code, series.title AS series_title,
+              series_episodes.season_number AS season_number, series_episodes.episode_number AS episode_number
+       FROM series_episodes INNER JOIN series ON series.id = series_episodes.series_id
+       WHERE series_episodes.id = (
+         SELECT e2.id FROM series_episodes e2 WHERE e2.series_id = series_episodes.series_id
+         ORDER BY e2.season_number DESC, e2.episode_number DESC LIMIT 1
+       )
+       ORDER BY series_episodes.created_at DESC, series_episodes.id DESC LIMIT ?`,
+    )
+    .all(limit) as Array<Record<string, unknown>>;
+  return rows.map((row) => ({
+    id: Number(row.id),
+    seriesCode: String(row.series_code),
+    seriesTitle: String(row.series_title),
+    seasonNumber: Number(row.season_number),
+    episodeNumber: Number(row.episode_number),
+  }));
+}
+
+type FavoriteKind = "movie" | "series" | "episode";
+
+/** `ref`: kino/serial uchun kod, qism uchun ID raqami (matn ko'rinishida). */
+function resolveContentId(kind: FavoriteKind, ref: string): number | null {
+  if (kind === "episode") {
+    if (!/^\d{1,12}$/.test(ref)) {
+      return null;
+    }
+    const row = database
+      .prepare("SELECT id FROM series_episodes WHERE id = ?")
+      .get(Number(ref)) as { id: number } | undefined;
+    return row ? Number(row.id) : null;
+  }
+
+  const table = kind === "movie" ? "movies" : "series";
+  const row = database
+    .prepare(`SELECT id FROM ${table} WHERE code = ?`)
+    .get(ref) as { id: number } | undefined;
+  return row ? Number(row.id) : null;
+}
+
+export function isFavorite(chatId: number, kind: FavoriteKind, ref: string): boolean {
+  const contentId = resolveContentId(kind, ref);
+  if (contentId === null) {
+    return false;
+  }
+  return (
+    database
+      .prepare("SELECT 1 FROM favorites WHERE chat_id = ? AND kind = ? AND content_id = ?")
+      .get(chatId, kind, contentId) !== undefined
+  );
+}
+
+/** Sevimlini almashtiradi: yangi holat (true = sevimli), topilmasa null. */
+export function toggleFavorite(
+  chatId: number,
+  kind: FavoriteKind,
+  ref: string,
+): boolean | null {
+  const contentId = resolveContentId(kind, ref);
+  if (contentId === null) {
+    return null;
+  }
+
+  if (isFavorite(chatId, kind, ref)) {
+    database
+      .prepare("DELETE FROM favorites WHERE chat_id = ? AND kind = ? AND content_id = ?")
+      .run(chatId, kind, contentId);
+    return false;
+  }
+
+  database
+    .prepare("INSERT OR IGNORE INTO favorites (chat_id, kind, content_id) VALUES (?, ?, ?)")
+    .run(chatId, kind, contentId);
+  return true;
+}
+
+/** Qism uchun `code` — qism ID raqami, `title` — "SERIAL — 1-fasl 5-qism". */
+export function listFavorites(
+  chatId: number,
+  limit = 50,
+): Array<{ kind: FavoriteKind; code: string; title: string }> {
+  const rows = database
+    .prepare(
+      `SELECT kind, code, title FROM (
+         SELECT 'movie' AS kind, movies.code AS code, movies.title AS title, favorites.rowid AS ord
+         FROM favorites INNER JOIN movies ON movies.id = favorites.content_id
+         WHERE favorites.chat_id = ? AND favorites.kind = 'movie'
+         UNION ALL
+         SELECT 'series', series.code, series.title, favorites.rowid
+         FROM favorites INNER JOIN series ON series.id = favorites.content_id
+         WHERE favorites.chat_id = ? AND favorites.kind = 'series'
+         UNION ALL
+         SELECT 'episode', CAST(series_episodes.id AS TEXT),
+                series.title || ' — ' || series_episodes.season_number || '-fasl ' ||
+                series_episodes.episode_number || '-qism',
+                favorites.rowid
+         FROM favorites
+         INNER JOIN series_episodes ON series_episodes.id = favorites.content_id
+         INNER JOIN series ON series.id = series_episodes.series_id
+         WHERE favorites.chat_id = ? AND favorites.kind = 'episode'
+       ) ORDER BY ord DESC LIMIT ?`,
+    )
+    .all(chatId, chatId, chatId, limit) as Array<{ kind: string; code: string; title: string }>;
+  return rows.map((row) => ({
+    kind: row.kind === "series" ? "series" : row.kind === "episode" ? "episode" : "movie",
+    code: String(row.code),
+    title: String(row.title),
+  }));
+}
+
+export function deleteSeries(code: string): boolean {
+  const result = database.prepare("DELETE FROM series WHERE code = ?").run(code);
+  return result.changes > 0;
+}
+
+export function deleteSeriesEpisode(
+  seriesCode: string,
+  seasonNumber: number,
+  episodeNumber: number,
+): boolean {
+  const result = database
+    .prepare(
+      `DELETE FROM series_episodes
+       WHERE series_id = (SELECT id FROM series WHERE code = ?)
+         AND season_number = ?
+         AND episode_number = ?`,
+    )
+    .run(seriesCode, seasonNumber, episodeNumber);
+  return result.changes > 0;
+}
+
+export function getLastDeliveredEpisodeMessage(
+  chatId: number,
+  seriesCode: string,
+): number | null {
+  const row = database
+    .prepare(
+      `SELECT series_last_delivery.message_id
+       FROM series_last_delivery
+       INNER JOIN series ON series.id = series_last_delivery.series_id
+       WHERE series_last_delivery.chat_id = ? AND series.code = ?`,
+    )
+    .get(chatId, seriesCode) as Record<string, unknown> | undefined;
+
+  return row ? Number(row.message_id) : null;
+}
+
+export function setLastDeliveredEpisodeMessage(
+  chatId: number,
+  seriesCode: string,
+  messageId: number,
+): void {
+  const series = database
+    .prepare("SELECT id FROM series WHERE code = ?")
+    .get(seriesCode) as Record<string, unknown> | undefined;
+  if (!series) {
+    return;
+  }
+
+  database
+    .prepare(
+      `INSERT INTO series_last_delivery (chat_id, series_id, message_id)
+       VALUES (?, ?, ?)
+       ON CONFLICT(chat_id, series_id) DO UPDATE SET
+         message_id = excluded.message_id,
+         updated_at = CURRENT_TIMESTAMP`,
+    )
+    .run(chatId, Number(series.id), messageId);
+}
+
+export function listGenres(): Array<{ name: string; movieCount: number }> {
+  const rows = database
+    .prepare(
+      `SELECT genres.name, COUNT(movie_genres.movie_id) AS movie_count
+       FROM genres
+       LEFT JOIN movie_genres ON movie_genres.genre_id = genres.id
+       GROUP BY genres.id
+       ORDER BY genres.name COLLATE NOCASE`,
+    )
+    .all() as Record<string, unknown>[];
+
+  return rows.map((row) => ({
+    name: String(row.name),
+    movieCount: Number(row.movie_count),
+  }));
+}
+
+export function listMoviesByGenre(genreName: string): Movie[] {
+  const rows = database
+    .prepare(
+      `SELECT movies.id, movies.code, movies.title,
+              movies.channel_chat_id, movies.channel_message_id, movies.created_at
+       FROM movies
+       INNER JOIN movie_genres ON movie_genres.movie_id = movies.id
+       INNER JOIN genres ON genres.id = movie_genres.genre_id
+       WHERE genres.name = ?
+       ORDER BY movies.title COLLATE NOCASE
+       LIMIT 50`,
+    )
+    .all(genreName) as Record<string, unknown>[];
+
+  return rows.map(mapMovie);
+}
+
+export function setMovieGenres(code: string, genreNames: string[]): boolean {
+  const movie = findMovie(code);
+  if (!movie) {
+    return false;
+  }
+
+  database
+    .prepare("DELETE FROM movie_genres WHERE movie_id = ?")
+    .run(movie.id);
+
+  const uniqueNames = [
+    ...new Set(
+      genreNames
+        .map((name) => name.trim())
+        .filter(Boolean)
+        .map((name) => name.slice(0, 80)),
+    ),
+  ];
+
+  for (const genreName of uniqueNames) {
+    database
+      .prepare(
+        `INSERT INTO genres (name) VALUES (?)
+         ON CONFLICT(name) DO NOTHING`,
+      )
+      .run(genreName);
+
+    const genre = database
+      .prepare("SELECT id FROM genres WHERE name = ?")
+      .get(genreName) as Record<string, unknown> | undefined;
+    if (!genre) {
+      continue;
+    }
+
+    database
+      .prepare(
+        `INSERT OR IGNORE INTO movie_genres (movie_id, genre_id)
+         VALUES (?, ?)`,
+      )
+      .run(movie.id, Number(genre.id));
+  }
+
+  return true;
+}
+
+export function upsertMovie(input: {
+  code: string;
+  title: string;
+  channelChatId: string;
+  channelMessageId: number;
+}): Movie {
+  database
+    .prepare(
+      `INSERT INTO movies (code, title, channel_chat_id, channel_message_id)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(code) DO UPDATE SET
+         title = excluded.title,
+         channel_chat_id = excluded.channel_chat_id,
+         channel_message_id = excluded.channel_message_id`,
+    )
+    .run(
+      input.code,
+      input.title,
+      input.channelChatId,
+      input.channelMessageId,
+    );
+
+  const movie = findMovie(input.code) as Movie;
+  database
+    .prepare(
+      `INSERT INTO movie_posts
+         (movie_id, post_number, title, channel_chat_id, channel_message_id)
+       VALUES (?, 1, ?, ?, ?)
+       ON CONFLICT(movie_id, post_number) DO UPDATE SET
+         title = excluded.title,
+         channel_chat_id = excluded.channel_chat_id,
+         channel_message_id = excluded.channel_message_id`,
+    )
+    .run(
+      movie.id,
+      input.title,
+      input.channelChatId,
+      input.channelMessageId,
+    );
+
+  return movie;
+}
+
+export function upsertMoviePost(input: {
+  movieCode: string;
+  postNumber: number;
+  title: string;
+  channelChatId: string;
+  channelMessageId: number;
+}): MoviePost | null {
+  const movie = findMovie(input.movieCode);
+  if (!movie) {
+    return null;
+  }
+
+  database
+    .prepare(
+      `INSERT INTO movie_posts
+         (movie_id, post_number, title, channel_chat_id, channel_message_id)
+       VALUES (?, ?, ?, ?, ?)
+       ON CONFLICT(movie_id, post_number) DO UPDATE SET
+         title = excluded.title,
+         channel_chat_id = excluded.channel_chat_id,
+         channel_message_id = excluded.channel_message_id`,
+    )
+    .run(
+      movie.id,
+      input.postNumber,
+      input.title,
+      input.channelChatId,
+      input.channelMessageId,
+    );
+
+  return (
+    listMoviePosts(input.movieCode).find(
+      (post) => post.postNumber === input.postNumber,
+    ) ?? null
+  );
+}
+
+export function deleteMovie(code: string): boolean {
+  const result = database.prepare("DELETE FROM movies WHERE code = ?").run(code);
+  return result.changes > 0;
+}
+
+export function getSetting(key: string): string | null {
+  const row = database
+    .prepare("SELECT value FROM settings WHERE key = ?")
+    .get(key) as Record<string, unknown> | undefined;
+
+  return row ? String(row.value) : null;
+}
+
+export function setSetting(key: string, value: string): void {
+  database
+    .prepare(
+      `INSERT INTO settings (key, value) VALUES (?, ?)
+       ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+    )
+    .run(key, value);
+}

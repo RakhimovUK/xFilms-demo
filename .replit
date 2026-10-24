@@ -1,0 +1,28 @@
+modules = ["nodejs-24"]
+
+[deployment]
+router = "application"
+deploymentTarget = "vm"
+build = ["sh", "-c", "corepack enable && pnpm install --frozen-lockfile && pnpm --filter @workspace/api-server run build"]
+run = ["sh", "-c", "node --enable-source-maps artifacts/api-server/dist/index.mjs"]
+
+[deployment.postBuild]
+args = ["pnpm", "store", "prune"]
+env = { "CI" = "true" }
+
+[workflows]
+runButton = "Project"
+
+[agent]
+stack = "PNPM_WORKSPACE"
+expertMode = true
+
+[postMerge]
+path = "scripts/post-merge.sh"
+timeoutMs = 20000
+
+[nix]
+channel = "stable-25_05"
+
+[[ports]]
+localPort = 8080

@@ -1,0 +1,66 @@
+import assert from "node:assert/strict";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import test from "node:test";
+
+process.env.DATABASE_PATH = path.join(mkdtempSync(path.join(tmpdir(), "xfilms-pp-")), "t.sqlite");
+const db = await import("../src/bot/database.ts");
+
+const add = (code: string, season: number, ep: number, msg: number) =>
+  db.upsertSeriesEpisode({ seriesCode: code, seasonNumber: season, episodeNumber: ep, title: "", channelChatId: "-100", channelMessageId: msg })!;
+
+db.upsertSeries({ code: "A", title: "Serial A" });
+db.upsertSeries({ code: "B", title: "Serial B" });
+const a1 = add("A", 1, 1, 1);
+const a2 = add("A", 1, 2, 2);
+const b1 = add("B", 1, 1, 3);
+
+test("poster: yo'q bo'lsa null, o'rnatilsa qaytadi, noma'lum serial false", () => {
+  assert.equal(db.getSeriesPoster("A"), null);
+  assert.equal(db.setSeriesPoster("A", "FILE_ID_1"), true);
+  assert.equal(db.getSeriesPoster("A"), "FILE_ID_1");
+  assert.equal(db.getSeriesPoster("B"), null);
+  assert.equal(db.setSeriesPoster("YOQ", "X"), false);
+});
+
+test("progress: foydalanuvchi va serial bo'yicha alohida", () => {
+  assert.equal(db.getSeriesProgress(1, "A"), null);
+  db.saveSeriesProgress(1, a2.id);
+  db.saveSeriesProgress(2, a1.id);
+  db.saveSeriesProgress(1, b1.id);
+  assert.equal(db.getSeriesProgress(1, "A")!.episodeNumber, 2);
+  assert.equal(db.getSeriesProgress(2, "A")!.episodeNumber, 1);
+  assert.equal(db.getSeriesProgress(1, "B")!.id, b1.id);
+  db.saveSeriesProgress(1, a1.id);
+  assert.equal(db.getSeriesProgress(1, "A")!.episodeNumber, 1);
+  assert.equal(db.getSeriesProgress(1, "B")!.id, b1.id);
+});
+
+test("progress: o'chirilgan qism va mavjud bo'lmagan ID xavfsiz", () => {
+  db.saveSeriesProgress(3, 999999);
+  assert.equal(db.getSeriesProgress(3, "A"), null);
+  db.saveSeriesProgress(4, a2.id);
+  db.deleteSeriesEpisode("A", 1, 2);
+  assert.equal(db.getSeriesProgress(4, "A"), null);
+});
+
+test("poster o'chirish: bor bo'lsa true, yo'q bo'lsa false, serial saqlanadi", () => {
+  db.setSeriesPoster("B", "FILE_B");
+  assert.equal(db.clearSeriesPoster("B"), true);
+  assert.equal(db.getSeriesPoster("B"), null);
+  assert.equal(db.clearSeriesPoster("B"), false);
+  assert.equal(db.clearSeriesPoster("YOQ"), false);
+  assert.ok(db.findSeries("B"));
+  assert.equal(db.listSeriesEpisodes("B").length, 1);
+});
+
+test("poster tavsifi: saqlanadi, bo'sh bo'lsa eskisi qoladi, o'chirilganda tozalanadi", () => {
+  db.setSeriesPoster("A", "F1", "Yulduzlar jangi tavsifi");
+  assert.equal(db.getSeriesPosterCaption("A"), "Yulduzlar jangi tavsifi");
+  db.setSeriesPoster("A", "F2");
+  assert.equal(db.getSeriesPosterCaption("A"), "Yulduzlar jangi tavsifi");
+  assert.equal(db.getSeriesPoster("A"), "F2");
+  db.clearSeriesPoster("A");
+  assert.equal(db.getSeriesPosterCaption("A"), null);
+});
